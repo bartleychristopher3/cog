@@ -15,26 +15,13 @@ from ..types import Path
 from .eventtypes import PredictionInput
 from .response_throttler import ResponseThrottler
 from .retry_transport import RetryTransport
+from .telemetry import current_trace_context
+from .useragent import get_user_agent
 
 log = structlog.get_logger(__name__)
 
 
-def _get_version() -> str:
-    try:
-        try:
-            from importlib.metadata import version
-        except ImportError:
-            pass
-        else:
-            return version("cog")
-        import pkg_resources
-
-        return pkg_resources.get_distribution("cog").version
-    except Exception:
-        return "unknown"
-
-
-_user_agent = f"cog-worker/{_get_version()} {httpx._client.USER_AGENT}"
+_user_agent = f"{get_user_agent()} {httpx._client.USER_AGENT}"
 _response_interval = float(os.environ.get("COG_THROTTLE_RESPONSE_INTERVAL", 0.5))
 
 # HACK: signal that we should skip the start webhook when the response interval
@@ -45,12 +32,24 @@ SKIP_START_EVENT = _response_interval < 0.1
 WebhookSenderType = Callable[[Any, WebhookEvent], Awaitable[None]]
 
 
-def webhook_headers() -> "dict[str, str]":
+def common_headers() -> "dict[str, str]":
     headers = {"user-agent": _user_agent}
+    return headers
+
+
+def webhook_headers() -> "dict[str, str]":
+    headers = common_headers()
     auth_token = os.environ.get("WEBHOOK_AUTH_TOKEN")
     if auth_token:
         headers["authorization"] = "Bearer " + auth_token
+
     return headers
+
+
+async def on_request_trace_context_hook(request: httpx.Request) -> None:
+    ctx = current_trace_context() or {}
+    for key, value in ctx.items():
+        request.headers[key] = str(value)
 
 
 def httpx_webhook_client() -> httpx.AsyncClient:
@@ -68,7 +67,10 @@ def httpx_retry_client() -> httpx.AsyncClient:
         retryable_methods=["POST"],
     )
     return httpx.AsyncClient(
-        headers=webhook_headers(), transport=transport, follow_redirects=True
+        event_hooks={"request": [on_request_trace_context_hook]},
+        headers=webhook_headers(),
+        transport=transport,
+        follow_redirects=True,
     )
 
 
@@ -87,6 +89,8 @@ def httpx_file_client() -> httpx.AsyncClient:
     # httpx default for pool is 5, use that
     timeout = httpx.Timeout(connect=10, read=15, write=None, pool=5)
     return httpx.AsyncClient(
+        event_hooks={"request": [on_request_trace_context_hook]},
+        headers=common_headers(),
         transport=transport,
         follow_redirects=True,
         timeout=timeout,
